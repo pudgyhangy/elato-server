@@ -107,7 +107,7 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
 server.on("request", async (req, res) => {
     const url = new URL(req.url!, `http://${req.headers.host}`);
 
-    if (url.pathname === "/api/generate_auth_token" && req.method === "GET") {
+    if (url.pathname.replace(/\/+/g, '/') === "/api/generate_auth_token" && req.method === "GET") {
         const macAddress = url.searchParams.get("macAddress");
         if (!macAddress) {
             res.writeHead(400, { "Content-Type": "application/json" });
