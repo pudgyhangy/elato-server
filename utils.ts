@@ -3,7 +3,8 @@ import { getUserByEmail } from "./supabase.ts";
 import { SupabaseClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
-import { Encoder } from "@evan/opus";
+// Using opusscript (WASM-based) instead of @evan/opus (native addon, incompatible with Deno Deploy)
+import OpusScript from "npm:opusscript";
 
 export const defaultVolume = 50;
 
@@ -16,25 +17,17 @@ export const SAMPLE_RATE = 24000; // For example, 24000 Hz
 const CHANNELS = 1; // Mono (set to 2 if you have stereo)
 const FRAME_DURATION = 120; // Frame length in ms
 const BYTES_PER_SAMPLE = 2; // 16-bit PCM: 2 bytes per sample
-const FRAME_SIZE = (SAMPLE_RATE * FRAME_DURATION / 1000) * CHANNELS *
-    BYTES_PER_SAMPLE; // 960 bytes for 24000 Hz mono 16-bit
+const FRAME_SAMPLES = Math.floor(SAMPLE_RATE * FRAME_DURATION / 1000); // samples per frame
+const FRAME_SIZE = FRAME_SAMPLES * CHANNELS * BYTES_PER_SAMPLE;
 
 export function createOpusEncoder() {
-    const enc = new Encoder({
-        channels: CHANNELS,
-        sample_rate: SAMPLE_RATE,
-        application: "voip",
-    });
-
-    enc.expert_frame_duration = FRAME_DURATION;
-    enc.bitrate = 24000;
-    return enc;
+    return new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
 }
 
 export function createOpusPacketizer(
     sendPacket: (packet: Uint8Array) => void,
 ) {
-    const enc = createOpusEncoder();
+    const enc = new OpusScript(SAMPLE_RATE, CHANNELS, OpusScript.Application.VOIP);
     let pending = Buffer.alloc(0);
     let closed = false;
 
@@ -48,7 +41,7 @@ export function createOpusPacketizer(
             const frame = pending.subarray(0, FRAME_SIZE);
             pending = pending.subarray(FRAME_SIZE);
             try {
-                const packet = enc.encode(frame);
+                const packet = enc.encode(frame, FRAME_SAMPLES);
                 sendPacket(packet);
             } catch (err) {
                 console.error("Opus encode failed:", err);
@@ -70,7 +63,7 @@ export function createOpusPacketizer(
         pending = Buffer.alloc(0);
 
         try {
-            const packet = enc.encode(padded);
+            const packet = enc.encode(padded, FRAME_SAMPLES);
             sendPacket(packet);
         } catch (err) {
             console.error("Opus encode failed:", err);
@@ -84,6 +77,7 @@ export function createOpusPacketizer(
     const close = () => {
         closed = true;
         pending = Buffer.alloc(0);
+        enc.delete();
     };
 
     const bufferedBytes = () => pending.length;
@@ -91,15 +85,8 @@ export function createOpusPacketizer(
     return { push, flush, reset, close, bufferedBytes };
 }
 
-// Legacy encoder for backwards compatibility during migration
-const encoder = new Encoder({
-    channels: CHANNELS,
-    sample_rate: SAMPLE_RATE,
-    application: "voip",
-});
-
-encoder.expert_frame_duration = FRAME_DURATION;
-encoder.bitrate = 24000;
+// Legacy encoder (lazy, for backwards compatibility)
+export const encoder = null;
 
 export const openaiApiKey = Deno.env.get("OPENAI_API_KEY");
 export const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
@@ -107,7 +94,7 @@ export const elevenLabsApiKey = Deno.env.get("ELEVENLABS_API_KEY");
 export const humeApiKey = Deno.env.get('HUME_API_KEY');
 export const xaiApiKey = Deno.env.get('XAI_API_KEY');
 
-export { encoder, FRAME_SIZE };
+export { FRAME_SIZE };
 
 export const isDev = Deno.env.get("DEV_MODE") === "True";
 
