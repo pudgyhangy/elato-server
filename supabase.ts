@@ -3,19 +3,14 @@ import { decryptSecret } from "./utils.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const supabaseKey = Deno.env.get("SUPABASE_KEY")!;
+const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 if (!supabaseUrl || !supabaseKey) {
     throw new Error("SUPABASE_URL or SUPABASE_KEY is not set");
 }
 
-export function getSupabaseClient(userJwt: string) {
-    return createClient(supabaseUrl, supabaseKey, {
-        global: {
-            headers: {
-                Authorization: `Bearer ${userJwt}`,
-            },
-        },
-    });
+export function getSupabaseClient(_userJwt?: string) {
+        return createClient(supabaseUrl, supabaseServiceRoleKey);
 }
 
 export const getUserByEmail = async (
