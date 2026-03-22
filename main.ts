@@ -4,6 +4,8 @@ import type {
     WebSocket as WSWebSocket,
     WebSocketServer as _WebSocketServer,
 } from "npm:@types/ws";
+import * as jose from "https://deno.land/x/jose@v5.9.6/index.ts";
+import { createClient } from "jsr:@supabase/supabase-js@2";
 import { authenticateUser } from "./utils.ts";
 import {
     createFirstMessage,
@@ -100,6 +102,73 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
         default:
             throw new Error(`Unknown provider: ${provider}`);
     }
+});
+
+server.on("request", async (req, res) => {
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+
+    if (url.pathname === "/api/generate_auth_token" && req.method === "GET") {
+        const macAddress = url.searchParams.get("macAddress");
+        if (!macAddress) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "macAddress is required" }));
+            return;
+        }
+        try {
+            const supabase = createClient(
+                Deno.env.get("SUPABASE_URL")!,
+                Deno.env.get("SUPABASE_KEY")!,
+            );
+
+            // Look up device by MAC address
+            const { data: device, error: deviceError } = await supabase
+                .from("devices")
+                .select("user_id")
+                .eq("mac_address", macAddress)
+                .single();
+
+            if (deviceError || !device) {
+                console.log("Device not found for MAC:", macAddress, deviceError);
+                res.writeHead(404, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Device not found" }));
+                return;
+            }
+
+            // Look up user email
+            const { data: user, error: userError } = await supabase
+                .from("users")
+                .select("email")
+                .eq("user_id", device.user_id)
+                .single();
+
+            if (userError || !user) {
+                console.log("User not found for user_id:", device.user_id, userError);
+                res.writeHead(404, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "User not found" }));
+                return;
+            }
+
+            // Generate JWT signed with JWT_SECRET_KEY
+            const jwtSecret = Deno.env.get("JWT_SECRET_KEY")!;
+            const secretBytes = new TextEncoder().encode(jwtSecret);
+            const token = await new jose.SignJWT({ email: user.email })
+                .setProtectedHeader({ alg: "HS256" })
+                .setExpirationTime("30d")
+                .sign(secretBytes);
+
+            console.log("Generated auth token for:", user.email);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ token }));
+        } catch (e: any) {
+            console.error("Error generating auth token:", e);
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: e.message }));
+        }
+        return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
 });
 
 server.on("upgrade", async (req, socket, head) => {
