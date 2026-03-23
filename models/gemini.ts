@@ -49,6 +49,10 @@ export const connectToGemini = async ({
     // Response queue for handling Google's callback-based responses
     const responseQueue: LiveServerMessage[] = [];
     let geminiSession: Session | null = null;
+    // Diagnostics
+    let audioPacketCount = 0;
+    let audioAmplitudeMax = 0;
+    let lastAmpLogTime = Date.now();
     async function waitMessage() {
         let done = false;
         let message: LiveServerMessage | undefined = undefined;
@@ -180,6 +184,9 @@ export const connectToGemini = async ({
                 },
                 onmessage: function (message: LiveServerMessage) {
                     responseQueue.push(message);
+                    if (message.serverContent) {
+                        console.log("Gemini serverContent:", JSON.stringify(message.serverContent).substring(0, 300));
+                    }
                 },
                 onerror: function (e: any) {
                     console.error("Gemini error:", e.message);
@@ -220,6 +227,17 @@ export const connectToGemini = async ({
         try {
             if (isBinary) {
                 // Handle binary audio data from ESP32
+                audioPacketCount++;
+                // Throttled amplitude check — runs once every 5 seconds
+                const pcmView = new Int16Array(data.buffer, data.byteOffset, Math.min(50, Math.floor(data.byteLength / 2)));
+                const amp = Math.max(...Array.from(pcmView).map(Math.abs));
+                if (amp > audioAmplitudeMax) audioAmplitudeMax = amp;
+                if (Date.now() - lastAmpLogTime >= 5000) {
+                    console.log(`[MIC] packets=${audioPacketCount} amplitude_max=${audioAmplitudeMax}`);
+                    audioPacketCount = 0;
+                    audioAmplitudeMax = 0;
+                    lastAmpLogTime = Date.now();
+                }
                 const base64Data = data.toString("base64");
                 if (isDev && connectionPcmFile) {
                     connectionPcmFile.write(data);
