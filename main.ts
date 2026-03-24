@@ -5,7 +5,7 @@ import type {
     WebSocket as WSWebSocket,
     WebSocketServer as _WebSocketServer,
 } from "npm:@types/ws";
-import { authenticateUser } from "./utils.ts";
+import { verifyHS256JWT } from "./utils.ts";
 import {
     createFirstMessage,
     createSystemPrompt,
@@ -13,6 +13,7 @@ import {
     getSupabaseClient,
     getAdminSupabaseClient,
     getEmailByMacAddress,
+    getUserByEmail,
 } from "./supabase.ts";
 import { SupabaseClient } from "@supabase/supabase-js";
 import { isDev } from "./utils.ts";
@@ -77,8 +78,36 @@ wss.on('headers', (headers, req) => {
     console.log('WS response headers :', headers);
 });
 
-wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
-    const { user, supabase } = payload;
+// ---------------------------------------------------------------------------
+// WebSocket connection handler — runs AFTER the handshake is complete.
+// This is a proper async WebSocket context; Supabase fetches work fine here.
+// ---------------------------------------------------------------------------
+wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac: string | undefined; timestamp: string }) => {
+    const { email, deviceMac, timestamp } = payload;
+    console.log(`WS connected: email=${email} deviceMac=${deviceMac}`);
+
+    // Fetch user from Supabase now that we're in a WebSocket async context
+    const supabase = getAdminSupabaseClient();
+    let user: IUser;
+    try {
+        user = await getUserByEmail(supabase, email);
+    } catch (err: any) {
+        console.log("WS connection: getUserByEmail failed:", err.message);
+        ws.close(1008, "User not found");
+        return;
+    }
+
+    // MAC address check (only when a MAC is registered for this user's device)
+    const expectedMac = user.device?.mac_address;
+    if (!isDev && deviceMac && expectedMac && deviceMac !== expectedMac) {
+        console.log(`WS connection: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
+        ws.close(1008, "MAC mismatch");
+        return;
+    }
+
+    console.log(`WS connection: user=${user.email} ready, provider=${user.personality?.provider}`);
+
+    const wsPayload: IPayload = { user, supabase, timestamp };
 
     let connectionPcmFile: Deno.FsFile | null = null;
     if (isDev) {
@@ -96,8 +125,8 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
         user.personality?.key ?? null,
         false,
     );
-    const firstMessage = createFirstMessage(payload);
-    const systemPrompt = createSystemPrompt(chatHistory, payload);
+    const firstMessage = createFirstMessage(wsPayload);
+    const systemPrompt = createSystemPrompt(chatHistory, wsPayload);
 
     const provider = user.personality?.provider;
 
@@ -121,7 +150,7 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
     // Common provider args
     const providerArgs: ProviderArgs = {
         ws,
-        payload,
+        payload: wsPayload,
         connectionPcmFile,
         firstMessage,
         systemPrompt,
@@ -149,64 +178,52 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
     }
 });
 
-server.on("upgrade", async (req, socket, head) => {
+// ---------------------------------------------------------------------------
+// HTTP upgrade → WebSocket handshake handler.
+// IMPORTANT: Do NO async work here. Deno Deploy aborts pending async operations
+// (fetch, SubtleCrypto, etc.) when the HTTP request transitions to a WebSocket.
+// Only synchronous operations are safe. Supabase user fetch is deferred to the
+// wss "connection" handler above which runs in a proper WebSocket async context.
+// ---------------------------------------------------------------------------
+server.on("upgrade", (req, socket, head) => {
     console.log('foobar upgrade', req.headers);
-    let user: IUser;
-    let supabase: SupabaseClient;
-    let authToken: string;
     try {
         const {
             authorization: authHeader,
             "x-wifi-rssi": rssi,
             "x-device-mac": deviceMac,
         } = req.headers;
-        authToken = authHeader?.replace("Bearer ", "") ?? "";
-        const wifiStrength = parseInt(rssi as string); // Convert to number
+        const authToken = authHeader?.replace("Bearer ", "") ?? "";
+        const wifiStrength = parseInt(rssi as string);
+        console.log("WiFi RSSI:", wifiStrength);
 
-        // You can now use wifiStrength in your code
-        console.log("WiFi RSSI:", wifiStrength); // Will log something like -50
-
-        // Remove debug logging
         if (!authToken) {
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
             return;
         }
 
-        // Use admin client — the custom JWT (signed with JWT_SECRET_KEY) is not a
-        // valid Supabase Auth token, so using it with PostgREST would fail.
-        // Admin client uses SUPABASE_KEY (service role) to bypass RLS.
-        supabase = getAdminSupabaseClient();
-        user = await authenticateUser(supabase, authToken as string);
+        const jwtSecret = Deno.env.get("JWT_SECRET_KEY");
+        if (!jwtSecret) throw new Error("JWT_SECRET_KEY not configured");
 
-        if (!user) {
-            throw new Error("User not found for token email");
-        }
+        // Synchronous HMAC-SHA256 JWT verification — safe in upgrade handler
+        const jwtPayload = verifyHS256JWT(authToken, jwtSecret);
+        const email = jwtPayload.email as string;
+        console.log(`WS upgrade: JWT OK email=${email} deviceMac=${deviceMac}`);
 
-        // MAC address check: only enforce when the user has a device with a MAC registered.
-        // If device_id isn't set in users table yet, expectedMac is undefined → skip check.
-        const expectedMac = user.device?.mac_address;
-        console.log(`WS upgrade: user=${user.email} deviceMac=${deviceMac} expectedMac=${expectedMac} isDev=${isDev}`);
-        if (!isDev && deviceMac && expectedMac && deviceMac !== expectedMac) {
-            console.log(`WS upgrade: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
-            socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-            socket.destroy();
-            return;
-        }
+        // Immediately complete the WS handshake — no async ops before this point
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit("connection", ws, {
+                email,
+                deviceMac: deviceMac as string | undefined,
+                timestamp: new Date().toISOString(),
+            });
+        });
     } catch (_e: any) {
-        console.log("WS upgrade auth failed:", _e?.message ?? _e);
+        console.log("WS upgrade failed:", _e?.message ?? _e);
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
-        return;
     }
-
-    wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit("connection", ws, {
-            user,
-            supabase,
-            timestamp: new Date().toISOString(),
-        });
-    });
 });
 
 if (isDev) { // RUN WITH: deno run -A --env-file=.env main.ts
