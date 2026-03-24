@@ -179,9 +179,16 @@ server.on("upgrade", async (req, socket, head) => {
         supabase = getAdminSupabaseClient();
         user = await authenticateUser(supabase, authToken as string);
 
-        // allow any mac address for dev
+        if (!user) {
+            throw new Error("User not found for token email");
+        }
+
+        // MAC address check: only enforce when the user has a device with a MAC registered.
+        // If device_id isn't set in users table yet, expectedMac is undefined → skip check.
         const expectedMac = user.device?.mac_address;
-        if (!isDev && deviceMac && deviceMac !== expectedMac) {
+        console.log(`WS upgrade: user=${user.email} deviceMac=${deviceMac} expectedMac=${expectedMac} isDev=${isDev}`);
+        if (!isDev && deviceMac && expectedMac && deviceMac !== expectedMac) {
+            console.error(`WS upgrade: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
             return;
