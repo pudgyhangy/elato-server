@@ -1,17 +1,17 @@
 import { createServer } from "node:http";
+import * as jose from "https://deno.land/x/jose@v5.9.6/index.ts";
 import { WebSocketServer } from "npm:ws";
 import type {
     WebSocket as WSWebSocket,
     WebSocketServer as _WebSocketServer,
 } from "npm:@types/ws";
-import * as jose from "https://deno.land/x/jose@v5.9.6/index.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
 import { authenticateUser } from "./utils.ts";
 import {
     createFirstMessage,
     createSystemPrompt,
     getChatHistory,
     getSupabaseClient,
+    getEmailByMacAddress,
 } from "./supabase.ts";
 import { SupabaseClient } from "@supabase/supabase-js";
 import { isDev } from "./utils.ts";
@@ -21,7 +21,51 @@ import { connectToElevenLabs } from "./models/elevenlabs.ts";
 import { connectToHume } from "./models/hume.ts";
 import { connectToGrok } from "./models/grok.ts";
 
-const server = createServer();
+const server = createServer(async (req, res) => {
+    // ---------------------------------------------------------------------------
+    // HTTP request handler (non-WebSocket).
+    // The firmware hits GET /api/generate_auth_token?macAddress=<mac> on boot to
+    // obtain a signed JWT it can then use as a Bearer token for the WS upgrade.
+    // ---------------------------------------------------------------------------
+    const url = new URL(req.url!, `http://${req.headers.host}`);
+
+    if (url.pathname === "/api/generate_auth_token") {
+        const mac = url.searchParams.get("macAddress");
+        if (!mac) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "macAddress query param required" }));
+            return;
+        }
+        try {
+            const email = await getEmailByMacAddress(mac);
+            if (!email) {
+                res.writeHead(404, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Device not registered — add MAC in Supabase devices table" }));
+                return;
+            }
+            const jwtSecret = Deno.env.get("JWT_SECRET_KEY");
+            if (!jwtSecret) throw new Error("JWT_SECRET_KEY env var not set");
+
+            const secretBytes = new TextEncoder().encode(jwtSecret);
+            const token = await new jose.SignJWT({ email })
+                .setProtectedHeader({ alg: "HS256" })
+                .setExpirationTime("30d")
+                .sign(secretBytes);
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ token }));
+        } catch (e: any) {
+            console.error("generate_auth_token error:", e);
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Internal server error", detail: e.message }));
+        }
+        return;
+    }
+
+    // Catch-all for any other HTTP path
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+});
 
 const wss: _WebSocketServer = new WebSocketServer({ noServer: true,
     perMessageDeflate: false,
@@ -102,73 +146,6 @@ wss.on("connection", async (ws: WSWebSocket, payload: IPayload) => {
         default:
             throw new Error(`Unknown provider: ${provider}`);
     }
-});
-
-server.on("request", async (req, res) => {
-    const url = new URL(req.url!, `http://${req.headers.host}`);
-
-    if (url.pathname.replace(/\/+/g, '/') === "/api/generate_auth_token" && req.method === "GET") {
-        const macAddress = url.searchParams.get("macAddress");
-        if (!macAddress) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "macAddress is required" }));
-            return;
-        }
-        try {
-            const supabase = createClient(
-                Deno.env.get("SUPABASE_URL")!,
-                Deno.env.get("SUPABASE_KEY")!,
-            );
-
-            // Look up device by MAC address
-            const { data: device, error: deviceError } = await supabase
-                .from("devices")
-                .select("user_id")
-                .eq("mac_address", macAddress)
-                .single();
-
-            if (deviceError || !device) {
-                console.log("Device not found for MAC:", macAddress, deviceError);
-                res.writeHead(404, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: "Device not found" }));
-                return;
-            }
-
-            // Look up user email
-            const { data: user, error: userError } = await supabase
-                .from("users")
-                .select("email")
-                .eq("user_id", device.user_id)
-                .single();
-
-            if (userError || !user) {
-                console.log("User not found for user_id:", device.user_id, userError);
-                res.writeHead(404, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: "User not found" }));
-                return;
-            }
-
-            // Generate JWT signed with JWT_SECRET_KEY
-            const jwtSecret = Deno.env.get("JWT_SECRET_KEY")!;
-            const secretBytes = new TextEncoder().encode(jwtSecret);
-            const token = await new jose.SignJWT({ email: user.email })
-                .setProtectedHeader({ alg: "HS256" })
-                .setExpirationTime("30d")
-                .sign(secretBytes);
-
-            console.log("Generated auth token for:", user.email);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ token }));
-        } catch (e: any) {
-            console.error("Error generating auth token:", e);
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: e.message }));
-        }
-        return;
-    }
-
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
 });
 
 server.on("upgrade", async (req, socket, head) => {
