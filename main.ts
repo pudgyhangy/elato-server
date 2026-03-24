@@ -11,6 +11,7 @@ import {
     createSystemPrompt,
     getChatHistory,
     getSupabaseClient,
+    getAdminSupabaseClient,
     getEmailByMacAddress,
 } from "./supabase.ts";
 import { SupabaseClient } from "@supabase/supabase-js";
@@ -172,7 +173,10 @@ server.on("upgrade", async (req, socket, head) => {
             return;
         }
 
-        supabase = getSupabaseClient(authToken as string);
+        // Use admin client — the custom JWT (signed with JWT_SECRET_KEY) is not a
+        // valid Supabase Auth token, so using it with PostgREST would fail.
+        // Admin client uses SUPABASE_KEY (service role) to bypass RLS.
+        supabase = getAdminSupabaseClient();
         user = await authenticateUser(supabase, authToken as string);
 
         // allow any mac address for dev
@@ -183,6 +187,7 @@ server.on("upgrade", async (req, socket, head) => {
             return;
         }
     } catch (_e: any) {
+        console.error("WS upgrade auth failed:", _e?.message ?? _e);
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
