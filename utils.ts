@@ -118,12 +118,17 @@ export const authenticateUser = async (
     try {
         const jwtSecret = Deno.env.get("JWT_SECRET_KEY");
 
-        if (!jwtSecret) throw new Error("JWT_SECRET_KEY not configured");
+        if (!jwtSecret) {
+            console.log("authenticateUser: JWT_SECRET_KEY is NOT set");
+            throw new Error("JWT_SECRET_KEY not configured");
+        }
 
+        console.log("authenticateUser: verifying JWT, token prefix=", authToken.substring(0, 20));
         const secretBytes = new TextEncoder().encode(jwtSecret);
         const payload = await jose.jwtVerify(authToken, secretBytes);
 
         const { payload: { email } } = payload;
+        console.log("authenticateUser: JWT OK, email=", email);
         // Use admin client so the query bypasses RLS — the custom JWT signed with
         // JWT_SECRET_KEY is not a valid Supabase Auth token, so passing it to
         // PostgREST would cause the query to fail with an auth error.
@@ -131,6 +136,7 @@ export const authenticateUser = async (
         const user = await getUserByEmail(admin, email as string);
         return user;
     } catch (error: any) {
+        console.log("authenticateUser ERROR:", error.message || error);
         throw new Error(error.message || "Failed to authenticate user");
     }
 };
