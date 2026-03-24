@@ -64,10 +64,13 @@ export const getUserByEmail = async (
         "*, language:languages(name), personality:personalities!users_personality_id_fkey(*), device:device_id(is_reset, is_ota, volume, mac_address)",
     ).eq("email", email);
 
-    console.log("data", data, error);
+    console.log("getUserByEmail: data length=", data?.length, "error=", error?.message);
 
     if (error) {
-        throw new Error("Failed to authenticate user");
+        throw new Error("Failed to authenticate user: " + error.message);
+    }
+    if (!data || data.length === 0) {
+        throw new Error("No user found for email: " + email);
     }
     return data[0] as IUser;
 };
