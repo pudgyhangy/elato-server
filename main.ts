@@ -188,13 +188,13 @@ server.on("upgrade", async (req, socket, head) => {
         const expectedMac = user.device?.mac_address;
         console.log(`WS upgrade: user=${user.email} deviceMac=${deviceMac} expectedMac=${expectedMac} isDev=${isDev}`);
         if (!isDev && deviceMac && expectedMac && deviceMac !== expectedMac) {
-            console.error(`WS upgrade: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
+            console.log(`WS upgrade: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
             socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
             socket.destroy();
             return;
         }
     } catch (_e: any) {
-        console.error("WS upgrade auth failed:", _e?.message ?? _e);
+        console.log("WS upgrade auth failed:", _e?.message ?? _e);
         socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
         socket.destroy();
         return;
