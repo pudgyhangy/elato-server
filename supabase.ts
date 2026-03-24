@@ -3,14 +3,57 @@ import { decryptSecret } from "./utils.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const supabaseKey = Deno.env.get("SUPABASE_KEY")!;
-const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 if (!supabaseUrl || !supabaseKey) {
     throw new Error("SUPABASE_URL or SUPABASE_KEY is not set");
 }
 
-export function getSupabaseClient(_userJwt?: string) {
-        return createClient(supabaseUrl, supabaseServiceRoleKey);
+export function getSupabaseClient(userJwt: string) {
+    return createClient(supabaseUrl, supabaseKey, {
+        global: {
+            headers: {
+                Authorization: `Bearer ${userJwt}`,
+            },
+        },
+    });
+}
+
+// Admin client — uses SUPABASE_KEY directly without a user JWT override.
+// Requires SUPABASE_KEY to be the service role key so it can bypass RLS.
+export function getAdminSupabaseClient() {
+    return createClient(supabaseUrl, supabaseKey);
+}
+
+// Look up the email of the user who owns a device with the given MAC address.
+// Returns null if no device or user is found.
+export async function getEmailByMacAddress(mac: string): Promise<string | null> {
+    const admin = getAdminSupabaseClient();
+
+    // devices table: mac_address → user_id (owner FK)
+    const { data: device, error: devErr } = await admin
+        .from("devices")
+        .select("user_id")
+        .eq("mac_address", mac)
+        .single();
+
+    if (devErr || !device) {
+        console.log("getEmailByMacAddress: device not found for MAC", mac, devErr?.message);
+        return null;
+    }
+
+    // users table: user_id → email
+    const { data: user, error: userErr } = await admin
+        .from("users")
+        .select("email")
+        .eq("user_id", device.user_id)
+        .single();
+
+    if (userErr || !user) {
+        console.log("getEmailByMacAddress: user not found for user_id", device.user_id, userErr?.message);
+        return null;
+    }
+
+    return user.email as string;
 }
 
 export const getUserByEmail = async (
