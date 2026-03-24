@@ -118,7 +118,7 @@ export const isDev = Deno.env.get("DEV_MODE") === "True";
  * request transitions to a WebSocket. This implementation uses the synchronous
  * crypto.createHmac() API which is safe in any context.
  */
-function verifyHS256JWT(token: string, secret: string): Record<string, unknown> {
+export function verifyHS256JWT(token: string, secret: string): Record<string, unknown> {
     const parts = token.split('.');
     if (parts.length !== 3) throw new Error("Invalid JWT format");
 
