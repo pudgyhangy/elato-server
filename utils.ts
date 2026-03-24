@@ -111,6 +111,34 @@ export { encoder, FRAME_SIZE };
 
 export const isDev = Deno.env.get("DEV_MODE") === "True";
 
+/**
+ * Synchronous HS256 JWT verification using Node.js crypto (no SubtleCrypto).
+ * jose.jwtVerify uses SubtleCrypto which hangs inside Deno Deploy's WebSocket
+ * upgrade event handler because that async context is aborted when the HTTP
+ * request transitions to a WebSocket. This implementation uses the synchronous
+ * crypto.createHmac() API which is safe in any context.
+ */
+function verifyHS256JWT(token: string, secret: string): Record<string, unknown> {
+    const parts = token.split('.');
+    if (parts.length !== 3) throw new Error("Invalid JWT format");
+
+    const sigInput = parts[0] + '.' + parts[1];
+    const expectedSig = crypto.createHmac('sha256', secret)
+        .update(sigInput)
+        .digest('base64url');
+
+    if (expectedSig !== parts[2]) throw new Error("JWSSignatureVerificationFailed");
+
+    const padded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+
+    if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) {
+        throw new Error("JWTExpired");
+    }
+
+    return payload;
+}
+
 export const authenticateUser = async (
     _supabaseClient: SupabaseClient,  // kept for API compatibility; admin client used internally
     authToken: string,
@@ -123,12 +151,11 @@ export const authenticateUser = async (
             throw new Error("JWT_SECRET_KEY not configured");
         }
 
-        console.log("authenticateUser: verifying JWT, token prefix=", authToken.substring(0, 20));
-        const secretBytes = new TextEncoder().encode(jwtSecret);
-        const payload = await jose.jwtVerify(authToken, secretBytes);
-
-        const { payload: { email } } = payload;
+        console.log("authenticateUser: verifying JWT (sync)");
+        const payload = verifyHS256JWT(authToken, jwtSecret);
+        const email = payload.email as string;
         console.log("authenticateUser: JWT OK, email=", email);
+
         // Use admin client so the query bypasses RLS — the custom JWT signed with
         // JWT_SECRET_KEY is not a valid Supabase Auth token, so passing it to
         // PostgREST would cause the query to fail with an auth error.
