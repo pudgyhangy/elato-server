@@ -23,6 +23,14 @@ import { connectToElevenLabs } from "./models/elevenlabs.ts";
 import { connectToHume } from "./models/hume.ts";
 import { connectToGrok } from "./models/grok.ts";
 
+// ---------------------------------------------------------------------------
+// Module-level user cache — populated during the HTTP generate_auth_token
+// request (where async Supabase fetches work fine) and consumed synchronously
+// in the WebSocket connection handler (where async Supabase fetches hang on
+// Deno Deploy due to the async-context abort on WS upgrade).
+// ---------------------------------------------------------------------------
+const userCache = new Map<string, IUser>();
+
 const server = createServer(async (req, res) => {
     // ---------------------------------------------------------------------------
     // HTTP request handler (non-WebSocket).
@@ -48,6 +56,20 @@ const server = createServer(async (req, res) => {
             const jwtSecret = Deno.env.get("JWT_SECRET_KEY");
             if (!jwtSecret) throw new Error("JWT_SECRET_KEY env var not set");
 
+            // Pre-fetch and cache the full user object while we are in an HTTP
+            // request context where Supabase async fetches complete normally.
+            // The WebSocket connection handler will read from this cache
+            // synchronously to avoid any async Supabase work in the WS context.
+            try {
+                const admin = getAdminSupabaseClient();
+                const user = await getUserByEmail(admin, email);
+                userCache.set(email, user);
+                console.log(`generate_auth_token: user cached for email=${email}`);
+            } catch (cacheErr: any) {
+                console.log(`generate_auth_token: user cache prefetch failed — ${cacheErr.message}`);
+                // Non-fatal: WS handler will reject if cache miss, prompting a retry
+            }
+
             const secretBytes = new TextEncoder().encode(jwtSecret);
             const token = await new jose.SignJWT({ email })
                 .setProtectedHeader({ alg: "HS256" })
@@ -57,7 +79,7 @@ const server = createServer(async (req, res) => {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ token }));
         } catch (e: any) {
-            console.error("generate_auth_token error:", e);
+            console.log("generate_auth_token error:", e.message ?? e);
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Internal server error", detail: e.message }));
         }
@@ -80,22 +102,26 @@ wss.on('headers', (headers, req) => {
 
 // ---------------------------------------------------------------------------
 // WebSocket connection handler — runs AFTER the handshake is complete.
-// This is a proper async WebSocket context; Supabase fetches work fine here.
+// User object is read from module-level cache (populated synchronously during
+// the generate_auth_token HTTP call) to avoid any async Supabase fetch here.
+// On Deno Deploy the firmware's ~2 s auth-message timeout closes the socket
+// before a fresh Supabase fetch can complete, causing a hang / reconnect loop.
 // ---------------------------------------------------------------------------
 wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac: string | undefined; timestamp: string }) => {
     const { email, deviceMac, timestamp } = payload;
     console.log(`WS connected: email=${email} deviceMac=${deviceMac}`);
 
-    // Fetch user from Supabase now that we're in a WebSocket async context
-    const supabase = getAdminSupabaseClient();
-    let user: IUser;
-    try {
-        user = await getUserByEmail(supabase, email);
-    } catch (err: any) {
-        console.log("WS connection: getUserByEmail failed:", err.message);
-        ws.close(1008, "User not found");
+    // Read user from module-level cache populated during generate_auth_token.
+    // We cannot do async Supabase fetches here: on Deno Deploy the async context
+    // is aborted when the firmware disconnects (after its ~2 s auth-message
+    // timeout), causing the fetch to never resolve and the handler to hang.
+    const user = userCache.get(email);
+    if (!user) {
+        console.log(`WS connection: no cached user for email=${email} — closing (device will retry)`);
+        ws.close(1008, "User not cached — please reconnect");
         return;
     }
+    console.log(`WS connection: user loaded from cache for email=${email}`);
 
     // MAC address check (only when a MAC is registered for this user's device)
     const expectedMac = user.device?.mac_address;
@@ -107,6 +133,10 @@ wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac
 
     console.log(`WS connection: user=${user.email} ready, provider=${user.personality?.provider}`);
 
+    // Admin Supabase client for conversation history / chat logging — these
+    // calls happen inside the WS session (not during the upgrade) so they are
+    // fine on Deno Deploy.
+    const supabase = getAdminSupabaseClient();
     const wsPayload: IPayload = { user, supabase, timestamp };
 
     let connectionPcmFile: Deno.FsFile | null = null;
