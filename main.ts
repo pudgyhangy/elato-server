@@ -139,6 +139,17 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
     );
     console.log(`WS connection: auth message sent to firmware`);
 
+    // ---------------------------------------------------------------------------
+    // KEEPALIVE: Deno Deploy's WS proxy closes connections idle for ~2 s.
+    // Sending a WebSocket ping frame every 1 s keeps the proxy satisfied while
+    // we wait for Gemini / other providers to connect (which can take 1–4 s).
+    // The firmware's WebSocketsClient library handles pong transparently.
+    // We clear this interval once the provider is fully connected.
+    // ---------------------------------------------------------------------------
+    const proxyKeepalive = setInterval(() => {
+        if (ws.readyState === 1 /* OPEN */) ws.ping();
+    }, 1000);
+
     // Admin Supabase client — now safe to use async because the firmware has
     // received the auth message and the WS is in a stable connected state.
     const supabase = getAdminSupabaseClient();
@@ -182,24 +193,28 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
         closeHandler,
     };
 
-        switch (provider) {
-            case "openai":
-                await connectToOpenAI(providerArgs);
-                break;
-            case "gemini":
-                await connectToGemini(providerArgs);
-                break;
-            case "grok":
-                await connectToGrok(providerArgs);
-                break;
-            case "elevenlabs":
-                await connectToElevenLabs(providerArgs);
-                break;
-            case "hume":
-                await connectToHume(providerArgs);
-                break;
-            default:
-                throw new Error(`Unknown provider: ${provider}`);
+        try {
+            switch (provider) {
+                case "openai":
+                    await connectToOpenAI(providerArgs);
+                    break;
+                case "gemini":
+                    await connectToGemini(providerArgs);
+                    break;
+                case "grok":
+                    await connectToGrok(providerArgs);
+                    break;
+                case "elevenlabs":
+                    await connectToElevenLabs(providerArgs);
+                    break;
+                case "hume":
+                    await connectToHume(providerArgs);
+                    break;
+                default:
+                    throw new Error(`Unknown provider: ${provider}`);
+            }
+        } finally {
+            clearInterval(proxyKeepalive);
         }
     } catch (err: any) {
         console.log(`WS connection handler error: ${err?.message ?? err}`);
