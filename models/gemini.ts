@@ -7,7 +7,7 @@ import {
     LiveServerMessage,
     Modality,
     Session,
-} from "npm:@google/genai";
+} from "npm:@google/genai@1.46.0";
 import { createOpusPacketizer, geminiApiKey, isDev, defaultGeminiVoice } from "../utils.ts";
 import { addConversation } from "../supabase.ts";
 
@@ -28,8 +28,10 @@ export const connectToGemini = async ({
     // Default v1beta silently produces no messages with native audio models on SDK ≥1.34
     // See: https://github.com/googleapis/js-genai/issues/1212
     const ai = new GoogleGenAI({ apiKey: geminiApiKey, httpOptions: { apiVersion: "v1alpha" } });
-    // CHANGE 1: updated model (09-2025 was deprecated March 19 2026)
-    const model = "gemini-2.5-flash-native-audio-preview-12-2025";
+    // CHANGE 1: updated model — -09-2025 was deprecated March 19 2026;
+    // -12-2025 was the interim dated preview; current stable model ID for
+    // native audio dialog on the Developer API free tier is:
+    const model = "gemini-2.5-flash-preview-native-audio-dialog";
     const config: LiveConnectConfig = {
         responseModalities: [Modality.AUDIO],
         systemInstruction: systemPrompt,
