@@ -24,7 +24,10 @@ export const connectToGemini = async ({
     const opus = createOpusPacketizer((packet) => ws.send(packet));
     console.log(`Connecting with Gemini key "${geminiApiKey?.slice(0, 3)}..."`);
     // Initialize Google GenAI
-    const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+    // apiVersion: "v1alpha" required for gemini-2.5-flash-native-audio-preview-12-2025
+    // Default v1beta silently produces no messages with native audio models on SDK ≥1.34
+    // See: https://github.com/googleapis/js-genai/issues/1212
+    const ai = new GoogleGenAI({ apiKey: geminiApiKey, apiVersion: "v1alpha" });
     // CHANGE 1: updated model (09-2025 was deprecated March 19 2026)
     const model = "gemini-2.5-flash-native-audio-preview-12-2025";
     const config: LiveConnectConfig = {
