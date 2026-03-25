@@ -133,6 +133,21 @@ export const connectToGemini = async ({
         }
     }
 
+    // ── DIAGNOSTIC: verify API key + model reachability via REST before Live WS ──
+    try {
+        const modelCheckUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}?key=${geminiApiKey}`;
+        const r = await fetch(modelCheckUrl);
+        const j = await r.json() as any;
+        if (r.ok) {
+            console.log(`Gemini model check OK: ${j.name} (${j.displayName ?? ""})`);
+        } else {
+            console.log(`Gemini model check FAILED: HTTP ${r.status} — ${j.error?.message ?? JSON.stringify(j).slice(0, 200)}`);
+        }
+    } catch (diagErr: unknown) {
+        console.log(`Gemini model check FETCH ERROR: ${diagErr}`);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Connect to Google Gemini Live
     try {
         console.log(`About to call ai.live.connect with model=${model}`);
