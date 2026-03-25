@@ -151,12 +151,20 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
         });
     }
 
-    const chatHistory = await getChatHistory(
-        supabase,
-        user.user_id,
-        user.personality?.key ?? null,
-        false,
-    );
+    // getChatHistory is a Supabase fetch. On Deno Deploy the async context
+    // right after a WS upgrade is unstable — Supabase fetches can hang
+    // indefinitely before any messages have been exchanged on the socket.
+    // We race against a 2-second timeout and fall back to empty history so
+    // that connectToGemini starts promptly and the firmware doesn't time out.
+    const chatHistory = await Promise.race([
+        getChatHistory(supabase, user.user_id, user.personality?.key ?? null, false),
+        new Promise<IConversation[]>((resolve) =>
+            setTimeout(() => {
+                console.log("getChatHistory timed out — proceeding with empty history");
+                resolve([]);
+            }, 2000)
+        ),
+    ]);
     const firstMessage = createFirstMessage(wsPayload);
     const systemPrompt = createSystemPrompt(chatHistory, wsPayload);
 
