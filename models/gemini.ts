@@ -1,18 +1,13 @@
 import { Buffer } from "node:buffer";
 import type { WebSocketServer as _WebSocketServer } from "npm:@types/ws";
-import {
-    EndSensitivity,
-    GoogleGenAI,
-    LiveConnectConfig,
-    LiveServerMessage,
-    Modality,
-    Session,
-} from "npm:@google/genai";
-// NOTE: Do NOT pin @google/genai to a specific version (e.g. @1.17.0).
-// Pinning to 1.17.0 causes ai.live.connect() to hang forever in Deno Deploy's
-// npm compat layer. Always use the latest (no version specifier).
 import { createOpusPacketizer, geminiApiKey, isDev, defaultGeminiVoice } from "../utils.ts";
 import { addConversation } from "../supabase.ts";
+
+// NOTE: We use native Deno WebSocket instead of npm:@google/genai because
+// the SDK's ai.live.connect() hangs forever in Deno Deploy's npm compat layer
+// regardless of SDK version. Native WebSocket is first-class in Deno Deploy.
+const GEMINI_LIVE_WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
 export const connectToGemini = async ({
     ws,
     payload,
@@ -24,203 +19,193 @@ export const connectToGemini = async ({
     const { user, supabase } = payload;
     const voiceName = user.personality?.oai_voice ?? defaultGeminiVoice;
     const opus = createOpusPacketizer((packet) => ws.send(packet));
-    console.log(`Connecting with Gemini key "${geminiApiKey?.slice(0, 3)}..."`);
-    // Initialize Google GenAI
-    const ai = new GoogleGenAI({ apiKey: geminiApiKey });
     const model = "gemini-2.5-flash-native-audio-preview-12-2025";
-    const config: LiveConnectConfig = {
-        responseModalities: [Modality.AUDIO],
-        systemInstruction: systemPrompt,
-        speechConfig: {
-            voiceConfig: {
-                prebuiltVoiceConfig: {
-                    voiceName: voiceName,
-                },
-            },
-        },
-        realtimeInputConfig: {
-            automaticActivityDetection: {
-                disabled: false,
-                endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-                silenceDurationMs: 100,
-            },
-        },
-        // outputAudioTranscription: {},   // known to cause 1007 Invalid Argument on -12-2025 model
-        // inputAudioTranscription: {},    // known to cause 1007 Invalid Argument on -12-2025 model
-    };
-    // Response queue for handling Google's callback-based responses
-    const responseQueue: LiveServerMessage[] = [];
-    let geminiSession: Session | null = null;
 
-    async function waitMessage() {
-        let done = false;
-        let message: LiveServerMessage | undefined = undefined;
-        while (!done) {
-            if (!geminiSession) {
-                return undefined;
-            }
-            message = responseQueue.shift();
-            if (message) {
-                done = true;
-            } else {
-                await new Promise((resolve) => setTimeout(resolve, 10));
-            }
+    console.log(`Connecting with Gemini key "${geminiApiKey?.slice(0, 3)}..." (native WS, model=${model})`);
+
+    const responseQueue: any[] = [];
+    let geminiWs: WebSocket | null = null;
+
+    async function waitMessage(): Promise<any | undefined> {
+        while (true) {
+            if (!geminiWs || geminiWs.readyState !== 1 /* OPEN */) return undefined;
+            const msg = responseQueue.shift();
+            if (msg) return msg;
+            await new Promise((r) => setTimeout(r, 10));
         }
-        return message;
     }
 
-    // Streams audio to the device as each Gemini message arrives, rather than
-    // collecting the entire response first. This reduces latency proportionally
-    // to response length (first audio reaches device as soon as Gemini starts speaking).
+    // Streams audio to the device as each Gemini message arrives.
     async function processGeminiTurns() {
         try {
             console.log("Processing Gemini turns");
-            while (geminiSession) {
+            while (geminiWs && geminiWs.readyState === 1) {
                 let responseSent = false;
                 let done = false;
-
-                opus.reset(); // clear encoder state at start of each turn
+                opus.reset();
 
                 while (!done) {
-                    const message = await waitMessage();
-                    if (!geminiSession || !message) {
-                        done = true;
-                        break;
-                    }
+                    const msg = await waitMessage();
+                    if (!geminiWs || !msg) { done = true; break; }
 
-                    if (message.serverContent) {
-                        // Stream audio to device as each chunk arrives from Gemini
-                        if ((message as any).data) {
-                            if (!responseSent) {
-                                responseSent = true;
-                                ws.send(JSON.stringify({
-                                    type: "server",
-                                    msg: "RESPONSE.CREATED",
-                                }));
+                    const sc = msg.serverContent;
+                    if (sc) {
+                        // Extract audio from modelTurn parts
+                        const parts: any[] = sc.modelTurn?.parts ?? [];
+                        for (const part of parts) {
+                            if (part.inlineData?.data) {
+                                if (!responseSent) {
+                                    responseSent = true;
+                                    ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.CREATED" }));
+                                }
+                                const buf = Buffer.from(part.inlineData.data, "base64");
+                                opus.push(Buffer.from(
+                                    new Int16Array(buf.buffer, buf.byteOffset, buf.byteLength / 2).buffer
+                                ));
                             }
-                            const buffer = Buffer.from((message as any).data, "base64");
-                            const intArray = new Int16Array(
-                                buffer.buffer,
-                                buffer.byteOffset,
-                                buffer.byteLength / Int16Array.BYTES_PER_ELEMENT,
-                            );
-                            opus.push(Buffer.from(new Int16Array(intArray).buffer));
                         }
-
-                        if (
-                            message.serverContent.generationComplete ||
-                            message.serverContent.turnComplete
-                        ) {
-                            if (responseSent) opus.flush(true); // finalise any buffered Opus frames
-                            ws.send(JSON.stringify({
-                                type: "server",
-                                msg: "RESPONSE.COMPLETE",
-                            }));
+                        if (sc.generationComplete || sc.turnComplete) {
+                            if (responseSent) opus.flush(true);
+                            ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.COMPLETE" }));
                             done = true;
                         }
                     }
                 }
 
-                if (!geminiSession) break;
-
-                // NOTE: addConversation (Supabase) hangs indefinitely in Deno Deploy WS context.
-                // Skipping for now to keep processGeminiTurns loop unblocked.
-                // await addConversation(supabase, "user", inputTranscriptionText, user);
-                // await addConversation(supabase, "assistant", outputTranscriptionText, user);
+                if (!geminiWs || geminiWs.readyState !== 1) break;
             }
-        } catch (error) {
-            console.log("Error processing Gemini turns:", error);
+        } catch (e) {
+            console.log("Error in processGeminiTurns:", e);
         }
     }
 
-    // ── DIAGNOSTIC: verify API key + model reachability via REST before Live WS ──
+    // ── Connect to Gemini Live API via native Deno WebSocket ──────────────────
     try {
-        const modelCheckUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}?key=${geminiApiKey}`;
-        const r = await fetch(modelCheckUrl);
-        const j = await r.json() as any;
-        if (r.ok) {
-            console.log(`Gemini model check OK: ${j.name} (${j.displayName ?? ""})`);
-        } else {
-            console.log(`Gemini model check FAILED: HTTP ${r.status} — ${j.error?.message ?? JSON.stringify(j).slice(0, 200)}`);
-        }
-    } catch (diagErr: unknown) {
-        console.log(`Gemini model check FETCH ERROR: ${diagErr}`);
-    }
-    // ─────────────────────────────────────────────────────────────────────────
+        geminiWs = new WebSocket(`${GEMINI_LIVE_WS}?key=${geminiApiKey}`);
 
-    // Connect to Google Gemini Live
-    try {
-        console.log(`About to call ai.live.connect with model=${model}`);
-        const connectTimeout = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("ai.live.connect() timed out after 10s — check model name and API key")), 10_000)
-        );
-        geminiSession = await Promise.race([
-            ai.live.connect({
-                model: model,
-                callbacks: {
-                    onopen: function () {
-                        console.log("Gemini session opened");
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() =>
+                reject(new Error("Gemini WS setup timed out (10s) — check API key / model access")), 10_000
+            );
+
+            geminiWs!.onopen = () => {
+                console.log("Gemini WS: opened — sending setup");
+                geminiWs!.send(JSON.stringify({
+                    setup: {
+                        model: `models/${model}`,
+                        generationConfig: {
+                            responseModalities: ["AUDIO"],
+                            speechConfig: {
+                                voiceConfig: {
+                                    prebuiltVoiceConfig: { voiceName },
+                                },
+                            },
+                        },
+                        systemInstruction: {
+                            parts: [{ text: systemPrompt }],
+                        },
+                        realtimeInputConfig: {
+                            automaticActivityDetection: {
+                                disabled: false,
+                                endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
+                                silenceDurationMs: 100,
+                            },
+                        },
                     },
-                    onmessage: function (message: LiveServerMessage) {
-                        responseQueue.push(message);
-                    },
-                    onerror: function (e: any) {
-                        // NOTE: was console.error (invisible on Deno Deploy) — now console.log
-                        console.log("Gemini error:", e?.message ?? e);
-                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.ERROR" }));
-                    },
-                    onclose: function (e: any) {
-                        console.log("Gemini session closed:", e?.reason ?? e?.code ?? "no reason");
-                        geminiSession = null;
-                        if (ws.readyState === 1 /* OPEN */) {
-                            ws.close();
-                        }
-                    },
-                },
-                config: config,
-            }),
-            connectTimeout,
-        ]);
-        console.log("Connected to Gemini successfully!");
-        const inputTurns = [{
-            role: "user",
-            parts: [{ text: firstMessage }],
-        }];
-        geminiSession?.sendClientContent({ turns: inputTurns });
+                }));
+            };
+
+            geminiWs!.onmessage = (event) => {
+                try {
+                    const parsed = JSON.parse(event.data as string);
+                    if ("setupComplete" in parsed) {
+                        console.log("Gemini WS: setupComplete received — session ready");
+                        clearTimeout(timeout);
+                        // Switch to normal message handler
+                        geminiWs!.onmessage = (ev) => {
+                            try { responseQueue.push(JSON.parse(ev.data as string)); } catch { /* ignore */ }
+                        };
+                        resolve();
+                    } else {
+                        // Unexpected pre-setup message — log and ignore
+                        console.log("Gemini WS: unexpected pre-setup message:", JSON.stringify(parsed).slice(0, 200));
+                    }
+                } catch (e) {
+                    console.log("Gemini WS: failed to parse setup message:", e);
+                }
+            };
+
+            geminiWs!.onerror = (e) => {
+                clearTimeout(timeout);
+                console.log("Gemini WS: error during setup:", e);
+                reject(new Error("Gemini WS error during setup"));
+            };
+
+            (geminiWs as any).onclose = (e: any) => {
+                clearTimeout(timeout);
+                const code = e?.code ?? "?";
+                const reason = e?.reason ?? "";
+                console.log(`Gemini WS: closed during setup — code=${code} reason="${reason}"`);
+                reject(new Error(`Gemini WS closed during setup: code=${code} reason="${reason}"`));
+            };
+        });
+
+        // ── Setup complete — replace close handler for runtime ────────────────
+        (geminiWs as any).onclose = (e: any) => {
+            const code = e?.code ?? "?";
+            const reason = e?.reason ?? "";
+            console.log(`Gemini session closed: code=${code} reason="${reason}"`);
+            geminiWs = null;
+            if (ws.readyState === 1 /* OPEN */) ws.close();
+        };
+
+        console.log("Connected to Gemini Live successfully!");
+
+        // Send opening text turn
+        geminiWs.send(JSON.stringify({
+            clientContent: {
+                turns: [{ role: "user", parts: [{ text: firstMessage }] }],
+                turnComplete: true,
+            },
+        }));
         processGeminiTurns();
+
     } catch (e: unknown) {
         console.log(`Error connecting to Gemini: ${e}`);
         ws.close();
         return;
     }
+    // ─────────────────────────────────────────────────────────────────────────
+
     ws.on("message", (data: any, isBinary: boolean) => {
         try {
             if (isBinary) {
                 const base64Data = data.toString("base64");
-                if (isDev && connectionPcmFile) {
-                    connectionPcmFile.write(data);
+                if (isDev && connectionPcmFile) connectionPcmFile.write(data);
+                if (geminiWs && geminiWs.readyState === 1) {
+                    geminiWs.send(JSON.stringify({
+                        realtimeInput: {
+                            audio: { data: base64Data, mimeType: "audio/pcm;rate=16000" },
+                        },
+                    }));
                 }
-                geminiSession?.sendRealtimeInput({
-                    audio: {
-                        data: base64Data,
-                        mimeType: "audio/pcm;rate=16000",
-                    },
-                });
             }
         } catch (e: unknown) {
             console.log("Error handling message:", (e as Error).message);
         }
     });
+
     ws.on("error", (error: any) => {
         console.log("WebSocket error:", error);
-        geminiSession?.close();
+        geminiWs?.close();
     });
+
     ws.on("close", async (code: number, reason: string) => {
         console.log(`WebSocket closed with code ${code}, reason: ${reason}`);
         await closeHandler();
         opus.close();
-        geminiSession?.close();
-        geminiSession = null;
+        geminiWs?.close();
+        geminiWs = null;
         if (isDev && connectionPcmFile) {
             connectionPcmFile.close();
             console.log("Closed debug audio file.");
