@@ -2,7 +2,7 @@ import { Buffer } from "node:buffer";
 import { createOpusPacketizer, geminiApiKey, isDev, defaultGeminiVoice } from "../utils.ts";
 
 // Native audio dialog model for Gemini Developer API free tier (v1alpha endpoint required)
-const GEMINI_MODEL = "models/gemini-2.5-flash-preview-native-audio-dialog";
+const GEMINI_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025";
 
 // The @google/genai SDK uses NodeWebSocketFactory → npm:ws internally.
 // npm:ws never fires onopen in Deno Deploy's npm compat layer, causing
