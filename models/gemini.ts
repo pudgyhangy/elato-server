@@ -7,7 +7,7 @@ import {
     LiveServerMessage,
     Modality,
     Session,
-} from "npm:@google/genai";
+} from "npm:@google/genai@1.17.0";
 import { createOpusPacketizer, geminiApiKey, isDev, defaultGeminiVoice } from "../utils.ts";
 import { addConversation } from "../supabase.ts";
 export const connectToGemini = async ({
@@ -42,8 +42,8 @@ export const connectToGemini = async ({
                 silenceDurationMs: 100,
             },
         },
-        outputAudioTranscription: {},
-        inputAudioTranscription: {},
+        // outputAudioTranscription: {},   // known to cause 1007 Invalid Argument on -12-2025 model
+        // inputAudioTranscription: {},    // known to cause 1007 Invalid Argument on -12-2025 model
     };
     // Response queue for handling Google's callback-based responses
     const responseQueue: LiveServerMessage[] = [];
@@ -74,8 +74,6 @@ export const connectToGemini = async ({
             console.log("Processing Gemini turns");
             while (geminiSession) {
                 let responseSent = false;
-                let outputTranscriptionText = "";
-                let inputTranscriptionText = "";
                 let done = false;
 
                 opus.reset(); // clear encoder state at start of each turn
@@ -106,15 +104,6 @@ export const connectToGemini = async ({
                             opus.push(Buffer.from(new Int16Array(intArray).buffer));
                         }
 
-                        if (message.serverContent.outputTranscription) {
-                            outputTranscriptionText +=
-                                message.serverContent.outputTranscription.text ?? "";
-                        }
-                        if (message.serverContent.inputTranscription) {
-                            inputTranscriptionText +=
-                                message.serverContent.inputTranscription.text ?? "";
-                        }
-
                         if (
                             message.serverContent.generationComplete ||
                             message.serverContent.turnComplete
@@ -131,8 +120,10 @@ export const connectToGemini = async ({
 
                 if (!geminiSession) break;
 
-                await addConversation(supabase, "user", inputTranscriptionText, user);
-                await addConversation(supabase, "assistant", outputTranscriptionText, user);
+                // NOTE: addConversation (Supabase) hangs indefinitely in Deno Deploy WS context.
+                // Skipping for now to keep processGeminiTurns loop unblocked.
+                // await addConversation(supabase, "user", inputTranscriptionText, user);
+                // await addConversation(supabase, "assistant", outputTranscriptionText, user);
             }
         } catch (error) {
             console.log("Error processing Gemini turns:", error);
@@ -141,6 +132,7 @@ export const connectToGemini = async ({
 
     // Connect to Google Gemini Live
     try {
+        console.log(`About to call ai.live.connect with model=${model}`);
         geminiSession = await ai.live.connect({
             model: model,
             callbacks: {
