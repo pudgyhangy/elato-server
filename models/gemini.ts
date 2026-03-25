@@ -139,22 +139,9 @@ export const connectToGemini = async ({
         }
     }
 
-    // Diagnostic: test if native Deno fetch works from WS connection context
-    console.log("WS context fetch test: starting...");
+    // Connect to Google Gemini Live
     try {
-        const fetchResult = await Promise.race([
-            fetch("https://httpbin.org/get"),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("fetch test timed out after 3s")), 3000)),
-        ]);
-        console.log("WS context fetch test: OK, status=" + fetchResult.status);
-    } catch (fetchErr: any) {
-        console.log("WS context fetch test: FAILED — " + (fetchErr?.message ?? fetchErr));
-    }
-
-    // Connect to Google Gemini Live — wrap with timeout to detect hangs
-    console.log("Calling ai.live.connect()...");
-    try {
-        const connectPromise = ai.live.connect({
+        geminiSession = await ai.live.connect({
             model: model,
             callbacks: {
                 onopen: function () {
@@ -178,10 +165,6 @@ export const connectToGemini = async ({
             },
             config: config,
         });
-        const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("ai.live.connect() TIMED OUT after 8s — hanging in WS context")), 8000)
-        );
-        geminiSession = await Promise.race([connectPromise, timeoutPromise]);
         console.log("Connected to Gemini successfully!");
         const inputTurns = [{
             role: "user",
