@@ -23,13 +23,6 @@ import { connectToElevenLabs } from "./models/elevenlabs.ts";
 import { connectToHume } from "./models/hume.ts";
 import { connectToGrok } from "./models/grok.ts";
 
-// ---------------------------------------------------------------------------
-// Module-level user cache — populated during the HTTP generate_auth_token
-// request (where async Supabase fetches work fine) and consumed synchronously
-// in the WebSocket connection handler (where async Supabase fetches hang on
-// Deno Deploy due to the async-context abort on WS upgrade).
-// ---------------------------------------------------------------------------
-const userCache = new Map<string, IUser>();
 
 const server = createServer(async (req, res) => {
     // ---------------------------------------------------------------------------
@@ -56,22 +49,28 @@ const server = createServer(async (req, res) => {
             const jwtSecret = Deno.env.get("JWT_SECRET_KEY");
             if (!jwtSecret) throw new Error("JWT_SECRET_KEY env var not set");
 
-            // Pre-fetch and cache the full user object while we are in an HTTP
-            // request context where Supabase async fetches complete normally.
-            // The WebSocket connection handler will read from this cache
-            // synchronously to avoid any async Supabase work in the WS context.
-            try {
-                const admin = getAdminSupabaseClient();
-                const user = await getUserByEmail(admin, email);
-                userCache.set(email, user);
-                console.log(`generate_auth_token: user cached for email=${email}`);
-            } catch (cacheErr: any) {
-                console.log(`generate_auth_token: user cache prefetch failed — ${cacheErr.message}`);
-                // Non-fatal: WS handler will reject if cache miss, prompting a retry
-            }
+            // Fetch the full user object while we are in a normal HTTP request
+            // context where Supabase async fetches complete reliably.
+            // We embed the full IUser into the JWT so the WS upgrade handler can
+            // reconstruct it synchronously — no Supabase call ever needed on the
+            // WS path. Module-level cache doesn't work across Deno Deploy isolates.
+            const admin = getAdminSupabaseClient();
+            const user = await getUserByEmail(admin, email);
+            console.log(`generate_auth_token: user fetched for email=${email}, provider=${user.personality?.provider}`);
 
             const secretBytes = new TextEncoder().encode(jwtSecret);
-            const token = await new jose.SignJWT({ email })
+            const token = await new jose.SignJWT({
+                email,
+                // Embed the full user so the WS handler needs zero Supabase calls
+                user_id:          user.user_id,
+                supervisee_name:  user.supervisee_name,
+                supervisee_age:   user.supervisee_age,
+                supervisee_persona: user.supervisee_persona,
+                user_info:        user.user_info,
+                language:         user.language,
+                personality:      user.personality,
+                device:           user.device,
+            })
                 .setProtectedHeader({ alg: "HS256" })
                 .setExpirationTime("30d")
                 .sign(secretBytes);
@@ -102,28 +101,16 @@ wss.on('headers', (headers, req) => {
 
 // ---------------------------------------------------------------------------
 // WebSocket connection handler — runs AFTER the handshake is complete.
-// User object is read from module-level cache (populated synchronously during
-// the generate_auth_token HTTP call) to avoid any async Supabase fetch here.
-// On Deno Deploy the firmware's ~2 s auth-message timeout closes the socket
-// before a fresh Supabase fetch can complete, causing a hang / reconnect loop.
+// The IUser object arrives in `payload` — decoded synchronously from JWT claims
+// in the upgrade handler, so zero Supabase calls are needed before we can send
+// the auth message. We send auth FIRST, then do getChatHistory async (safe once
+// the firmware has received auth and the WS connection is stable).
 // ---------------------------------------------------------------------------
-wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac: string | undefined; timestamp: string }) => {
-    const { email, deviceMac, timestamp } = payload;
-    console.log(`WS connected: email=${email} deviceMac=${deviceMac}`);
+wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: string | undefined; timestamp: string }) => {
+    const { user, deviceMac, timestamp } = payload;
+    console.log(`WS connected: email=${user.email} deviceMac=${deviceMac}`);
 
-    // Read user from module-level cache populated during generate_auth_token.
-    // We cannot do async Supabase fetches here: on Deno Deploy the async context
-    // is aborted when the firmware disconnects (after its ~2 s auth-message
-    // timeout), causing the fetch to never resolve and the handler to hang.
-    const user = userCache.get(email);
-    if (!user) {
-        console.log(`WS connection: no cached user for email=${email} — closing (device will retry)`);
-        ws.close(1008, "User not cached — please reconnect");
-        return;
-    }
-    console.log(`WS connection: user loaded from cache for email=${email}`);
-
-    // MAC address check (only when a MAC is registered for this user's device)
+    // MAC address check using device info already in the JWT
     const expectedMac = user.device?.mac_address;
     if (!isDev && deviceMac && expectedMac && deviceMac !== expectedMac) {
         console.log(`WS connection: MAC mismatch — got ${deviceMac}, expected ${expectedMac}`);
@@ -133,9 +120,24 @@ wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac
 
     console.log(`WS connection: user=${user.email} ready, provider=${user.personality?.provider}`);
 
-    // Admin Supabase client for conversation history / chat logging — these
-    // calls happen inside the WS session (not during the upgrade) so they are
-    // fine on Deno Deploy.
+    // -----------------------------------------------------------------------
+    // Send the auth message IMMEDIATELY — the firmware closes the socket after
+    // ~2 s if it doesn't receive this. Sending it first keeps the connection
+    // alive while we do the async Supabase work below.
+    // -----------------------------------------------------------------------
+    ws.send(
+        JSON.stringify({
+            type: "auth",
+            volume_control: user.device?.volume ?? 50,
+            is_ota:         user.device?.is_ota  ?? false,
+            is_reset:       user.device?.is_reset ?? false,
+            pitch_factor:   user.personality?.pitch_factor ?? 1,
+        }),
+    );
+    console.log(`WS connection: auth message sent to firmware`);
+
+    // Admin Supabase client — now safe to use async because the firmware has
+    // received the auth message and the WS is in a stable connected state.
     const supabase = getAdminSupabaseClient();
     const wsPayload: IPayload = { user, supabase, timestamp };
 
@@ -159,18 +161,6 @@ wss.on("connection", async (ws: WSWebSocket, payload: { email: string; deviceMac
     const systemPrompt = createSystemPrompt(chatHistory, wsPayload);
 
     const provider = user.personality?.provider;
-
-    // send user details to client
-    // when DEV_MODE is true, we send the default values 100, false, false
-    ws.send(
-        JSON.stringify({
-            type: "auth",
-            volume_control: user.device?.volume ?? 50,
-            is_ota: user.device?.is_ota ?? false,
-            is_reset: user.device?.is_reset ?? false,
-            pitch_factor: user.personality?.pitch_factor ?? 1,
-        }),
-    );
 
     // Common close handler for cleanup
     const closeHandler = async () => {
@@ -241,10 +231,24 @@ server.on("upgrade", (req, socket, head) => {
         const email = jwtPayload.email as string;
         console.log(`WS upgrade: JWT OK email=${email} deviceMac=${deviceMac}`);
 
+        // Reconstruct the IUser from JWT claims — zero Supabase calls needed.
+        // The full user object was embedded when the token was issued.
+        const userFromJWT: IUser = {
+            user_id:           jwtPayload.user_id          as string,
+            email:             email,
+            supervisee_name:   jwtPayload.supervisee_name  as string,
+            supervisee_age:    jwtPayload.supervisee_age   as string,
+            supervisee_persona: jwtPayload.supervisee_persona as string,
+            user_info:         jwtPayload.user_info        as IUser["user_info"],
+            language:          jwtPayload.language         as IUser["language"],
+            personality:       jwtPayload.personality      as IUser["personality"],
+            device:            jwtPayload.device           as IUser["device"],
+        };
+
         // Immediately complete the WS handshake — no async ops before this point
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit("connection", ws, {
-                email,
+                user: userFromJWT,
                 deviceMac: deviceMac as string | undefined,
                 timestamp: new Date().toISOString(),
             });
