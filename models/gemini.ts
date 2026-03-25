@@ -135,13 +135,26 @@ export const connectToGemini = async ({
                 await addConversation(supabase, "assistant", outputTranscriptionText, user);
             }
         } catch (error) {
-            console.error("Error processing Gemini turns:", error);
+            console.log("Error processing Gemini turns:", error);
         }
     }
 
-    // Connect to Google Gemini Live
+    // Diagnostic: test if native Deno fetch works from WS connection context
+    console.log("WS context fetch test: starting...");
     try {
-        geminiSession = await ai.live.connect({
+        const fetchResult = await Promise.race([
+            fetch("https://httpbin.org/get"),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error("fetch test timed out after 3s")), 3000)),
+        ]);
+        console.log("WS context fetch test: OK, status=" + fetchResult.status);
+    } catch (fetchErr: any) {
+        console.log("WS context fetch test: FAILED — " + (fetchErr?.message ?? fetchErr));
+    }
+
+    // Connect to Google Gemini Live — wrap with timeout to detect hangs
+    console.log("Calling ai.live.connect()...");
+    try {
+        const connectPromise = ai.live.connect({
             model: model,
             callbacks: {
                 onopen: function () {
@@ -151,16 +164,12 @@ export const connectToGemini = async ({
                     responseQueue.push(message);
                 },
                 onerror: function (e: any) {
-                    console.error("Gemini error:", e.message);
-                    ws.send(
-                        JSON.stringify({
-                            type: "server",
-                            msg: "RESPONSE.ERROR",
-                        }),
-                    );
+                    // NOTE: was console.error (invisible on Deno Deploy) — now console.log
+                    console.log("Gemini error:", e?.message ?? e);
+                    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.ERROR" }));
                 },
                 onclose: function (e: any) {
-                    console.log("Gemini session closed:", e.reason);
+                    console.log("Gemini session closed:", e?.reason ?? e?.code ?? "no reason");
                     geminiSession = null;
                     if (ws.readyState === 1 /* OPEN */) {
                         ws.close();
@@ -169,6 +178,10 @@ export const connectToGemini = async ({
             },
             config: config,
         });
+        const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("ai.live.connect() TIMED OUT after 8s — hanging in WS context")), 8000)
+        );
+        geminiSession = await Promise.race([connectPromise, timeoutPromise]);
         console.log("Connected to Gemini successfully!");
         const inputTurns = [{
             role: "user",
@@ -196,11 +209,11 @@ export const connectToGemini = async ({
                 });
             }
         } catch (e: unknown) {
-            console.error("Error handling message:", (e as Error).message);
+            console.log("Error handling message:", (e as Error).message);
         }
     });
     ws.on("error", (error: any) => {
-        console.error("WebSocket error:", error);
+        console.log("WebSocket error:", error);
         geminiSession?.close();
     });
     ws.on("close", async (code: number, reason: string) => {
