@@ -137,12 +137,21 @@ export const connectToGemini = async ({
                 geminiClosed = true;
             };
 
-            geminiWs.onmessage = (event: MessageEvent) => {
+            geminiWs.onmessage = async (event: MessageEvent) => {
                 try {
-                    const msg = JSON.parse(event.data as string);
+                    // Deno's native WebSocket surfaces binary frames as Blob objects.
+                    // Even though Gemini sends JSON, it uses binary WS frames — must decode first.
+                    let text: string;
+                    if (event.data instanceof Blob) {
+                        text = await event.data.text();
+                    } else if (event.data instanceof ArrayBuffer) {
+                        text = new TextDecoder().decode(event.data);
+                    } else {
+                        text = event.data as string;
+                    }
+                    const msg = JSON.parse(text);
                     if (msg.setupComplete) {
                         console.log("Gemini setup complete — sending first message");
-                        // Send initial context message once server confirms setup
                         geminiWs!.send(JSON.stringify({
                             clientContent: {
                                 turns: [{ role: "user", parts: [{ text: firstMessage }] }],
