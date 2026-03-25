@@ -1,19 +1,16 @@
-# Set up the base image
-FROM public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 AS aws-lambda-adapter
-FROM denoland/deno:bin-2.0.2 AS deno_bin
-FROM debian:bookworm-20230703-slim AS deno_runtime
-COPY --from=aws-lambda-adapter /lambda-adapter /opt/extensions/lambda-adapter
-COPY --from=deno_bin /deno /usr/local/bin/deno
-ENV PORT=8000
+# Dockerfile for Fly.io deployment
+# Replaces the previous AWS Lambda adapter version — Fly.io doesn't need it.
+
+FROM denoland/deno:2.0.2
+
+WORKDIR /app
+
+# Copy everything
+COPY . .
+
+# Pre-cache all dependencies so the first request isn't slow
+RUN deno cache main.ts
+
 EXPOSE 8000
-RUN mkdir /var/deno_dir
-ENV DENO_DIR=/var/deno_dir
-
-# Copy the function code
-WORKDIR "/var/task"
-COPY . /var/task
-
-# Warmup caches
-RUN timeout 10s deno run -A main.ts || [ $? -eq 124 ] || exit 1
 
 CMD ["deno", "run", "-A", "main.ts"]
