@@ -140,14 +140,16 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
     console.log(`WS connection: auth message sent to firmware`);
 
     // ---------------------------------------------------------------------------
-    // KEEPALIVE: Deno Deploy's WS proxy closes connections idle for ~2 s.
-    // Sending a WebSocket ping frame every 1 s keeps the proxy satisfied while
-    // we wait for Gemini / other providers to connect (which can take 1–4 s).
-    // The firmware's WebSocketsClient library handles pong transparently.
+    // KEEPALIVE: Deno Deploy's reverse-proxy closes WebSocket connections that
+    // carry no frames for ~2 s. PING control frames do NOT reset the proxy
+    // timer — only TEXT or BINARY data frames count as activity.
+    // We send a {"type":"ping"} JSON text frame every 1 s. The firmware's
+    // webSocketEvent handler checks for "auth" and "server" types; anything
+    // else falls through silently, so the firmware ignores these frames.
     // We clear this interval once the provider is fully connected.
     // ---------------------------------------------------------------------------
     const proxyKeepalive = setInterval(() => {
-        if (ws.readyState === 1 /* OPEN */) ws.ping();
+        if (ws.readyState === 1 /* OPEN */) ws.send(JSON.stringify({ type: "ping" }));
     }, 1000);
 
     // Admin Supabase client — now safe to use async because the firmware has
