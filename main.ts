@@ -102,13 +102,16 @@ wss.on('headers', (headers, req) => {
 // ---------------------------------------------------------------------------
 // WebSocket connection handler — runs AFTER the handshake is complete.
 // The IUser object arrives in `payload` — decoded synchronously from JWT claims
-// in the upgrade handler, so zero Supabase calls are needed before we can send
-// the auth message. We send auth FIRST, then do getChatHistory async (safe once
-// the firmware has received auth and the WS connection is stable).
+// in the upgrade handler. Zero Supabase calls are made in this handler:
+// getChatHistory hangs on Deno Deploy (platform kills stalled async fetches in
+// WS context). We start Gemini with empty history and catch all errors.
 // ---------------------------------------------------------------------------
 wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: string | undefined; timestamp: string }) => {
     const { user, deviceMac, timestamp } = payload;
     console.log(`WS connected: email=${user.email} deviceMac=${deviceMac}`);
+    // Wrap the entire handler so any unhandled exception is logged rather than
+    // silently closing the WebSocket with no trace in Deno Deploy logs.
+    try {
 
     // MAC address check using device info already in the JWT
     const expectedMac = user.device?.mac_address;
@@ -151,20 +154,14 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
         });
     }
 
-    // getChatHistory is a Supabase fetch. On Deno Deploy the async context
-    // right after a WS upgrade is unstable — Supabase fetches can hang
-    // indefinitely before any messages have been exchanged on the socket.
-    // We race against a 2-second timeout and fall back to empty history so
-    // that connectToGemini starts promptly and the firmware doesn't time out.
-    const chatHistory = await Promise.race([
-        getChatHistory(supabase, user.user_id, user.personality?.key ?? null, false),
-        new Promise<IConversation[]>((resolve) =>
-            setTimeout(() => {
-                console.log("getChatHistory timed out — proceeding with empty history");
-                resolve([]);
-            }, 2000)
-        ),
-    ]);
+    // getChatHistory makes a Supabase fetch. On Deno Deploy, ANY Supabase fetch
+    // in the WebSocket handler context hangs indefinitely — the platform appears
+    // to kill async HTTP operations that are in-flight when it detects a stalled
+    // isolate, which also cancels any setTimeout fallback we create.
+    // Skip it entirely and start Gemini with empty history so the connection
+    // is established without any blocking async work in the WS path.
+    console.log("WS connection: skipping getChatHistory (Supabase hangs in WS context on Deno Deploy)");
+    const chatHistory: IConversation[] = [];
     const firstMessage = createFirstMessage(wsPayload);
     const systemPrompt = createSystemPrompt(chatHistory, wsPayload);
 
@@ -185,24 +182,28 @@ wss.on("connection", async (ws: WSWebSocket, payload: { user: IUser; deviceMac: 
         closeHandler,
     };
 
-    switch (provider) {
-        case "openai":
-            await connectToOpenAI(providerArgs);
-            break;
-        case "gemini":
-            await connectToGemini(providerArgs);
-            break;
-        case "grok":
-            await connectToGrok(providerArgs);
-            break;
-        case "elevenlabs":
-            await connectToElevenLabs(providerArgs);
-            break;
-        case "hume":
-            await connectToHume(providerArgs);
-            break;
-        default:
-            throw new Error(`Unknown provider: ${provider}`);
+        switch (provider) {
+            case "openai":
+                await connectToOpenAI(providerArgs);
+                break;
+            case "gemini":
+                await connectToGemini(providerArgs);
+                break;
+            case "grok":
+                await connectToGrok(providerArgs);
+                break;
+            case "elevenlabs":
+                await connectToElevenLabs(providerArgs);
+                break;
+            case "hume":
+                await connectToHume(providerArgs);
+                break;
+            default:
+                throw new Error(`Unknown provider: ${provider}`);
+        }
+    } catch (err: any) {
+        console.log(`WS connection handler error: ${err?.message ?? err}`);
+        if (ws.readyState === 1 /* OPEN */) ws.close(1011, "Internal error");
     }
 });
 
