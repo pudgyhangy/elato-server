@@ -7,7 +7,10 @@ import {
     LiveServerMessage,
     Modality,
     Session,
-} from "npm:@google/genai@1.17.0";
+} from "npm:@google/genai";
+// NOTE: Do NOT pin @google/genai to a specific version (e.g. @1.17.0).
+// Pinning to 1.17.0 causes ai.live.connect() to hang forever in Deno Deploy's
+// npm compat layer. Always use the latest (no version specifier).
 import { createOpusPacketizer, geminiApiKey, isDev, defaultGeminiVoice } from "../utils.ts";
 import { addConversation } from "../supabase.ts";
 export const connectToGemini = async ({
@@ -133,30 +136,36 @@ export const connectToGemini = async ({
     // Connect to Google Gemini Live
     try {
         console.log(`About to call ai.live.connect with model=${model}`);
-        geminiSession = await ai.live.connect({
-            model: model,
-            callbacks: {
-                onopen: function () {
-                    console.log("Gemini session opened");
+        const connectTimeout = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("ai.live.connect() timed out after 10s — check model name and API key")), 10_000)
+        );
+        geminiSession = await Promise.race([
+            ai.live.connect({
+                model: model,
+                callbacks: {
+                    onopen: function () {
+                        console.log("Gemini session opened");
+                    },
+                    onmessage: function (message: LiveServerMessage) {
+                        responseQueue.push(message);
+                    },
+                    onerror: function (e: any) {
+                        // NOTE: was console.error (invisible on Deno Deploy) — now console.log
+                        console.log("Gemini error:", e?.message ?? e);
+                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.ERROR" }));
+                    },
+                    onclose: function (e: any) {
+                        console.log("Gemini session closed:", e?.reason ?? e?.code ?? "no reason");
+                        geminiSession = null;
+                        if (ws.readyState === 1 /* OPEN */) {
+                            ws.close();
+                        }
+                    },
                 },
-                onmessage: function (message: LiveServerMessage) {
-                    responseQueue.push(message);
-                },
-                onerror: function (e: any) {
-                    // NOTE: was console.error (invisible on Deno Deploy) — now console.log
-                    console.log("Gemini error:", e?.message ?? e);
-                    if (ws.readyState === 1) ws.send(JSON.stringify({ type: "server", msg: "RESPONSE.ERROR" }));
-                },
-                onclose: function (e: any) {
-                    console.log("Gemini session closed:", e?.reason ?? e?.code ?? "no reason");
-                    geminiSession = null;
-                    if (ws.readyState === 1 /* OPEN */) {
-                        ws.close();
-                    }
-                },
-            },
-            config: config,
-        });
+                config: config,
+            }),
+            connectTimeout,
+        ]);
         console.log("Connected to Gemini successfully!");
         const inputTurns = [{
             role: "user",
